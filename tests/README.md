@@ -1,0 +1,96 @@
+# Plugin Test Guide
+
+Use this directory for two related jobs:
+
+- [`prompt-catalog.md`](prompt-catalog.md) gives users and internal testers a representative prompt for every plugin capability.
+- [`test-scenarios.md`](test-scenarios.md) defines the deeper behavioral checks for API routing, safety, schemas, and multi-step execution.
+- [`test-openapi-fetch.sh`](test-openapi-fetch.sh) verifies public OpenAPI retrieval, failure handling, and preflight coverage across every API-calling skill.
+- [`test-marketplace-metadata.sh`](test-marketplace-metadata.sh) keeps the distinct Codex and Claude marketplace source formats valid and intentional.
+
+The prompt catalog is the quickest smoke-test surface. The scenarios are the source of truth when validating a release.
+
+The shell regression suites run offline with no credentials, no network, and no API calls:
+
+```bash
+bash tests/test-check-token.sh    # hooks/check-token.sh
+bash tests/test-api-request.sh    # scripts/api-request.sh --env
+bash tests/test-openapi-fetch.sh  # scripts/fetch-openapi-schema.sh
+bash tests/test-openapi-tool.sh   # openapi_tool.py, openapi-op.sh, api-request.sh pre-send validation
+bash tests/test-audience-estimates.sh   # estimate examples keep bid_micro_amount, incl. AUTOBID
+bash tests/test-marketplace-metadata.sh
+```
+
+Run the relevant suites after changing scripts or marketplace metadata. They exit non-zero on failure.
+
+## Prerequisites
+
+1. A Spotify Developer app with Ads API access
+2. A Spotify Ads business and ad account suitable for testing
+3. Python 3.8+ or `uv` for the secure OAuth and direct-token configuration helpers
+4. Codex, Claude Code, or Antigravity with this source checkout installed
+5. Test creative files and a synthetic customer-list CSV when exercising uploads
+
+Never use real customer data in plugin tests. Prefix test campaign, ad set, and ad names with `[Test reject]` so test ads are rejected by review and cannot serve.
+
+## Suggested runs
+
+### Read-only smoke test
+
+Run scenarios 1-2, 7, 13-14, 22, 26, 28-29, 31, and 32. These cover configuration plus the major read-only and planning skills without changing campaign or account state.
+
+### Creation and draft workflow
+
+Run scenarios 3-6 and 11-21 sequentially. Several scenarios reuse IDs or assets created by earlier scenarios. Keep the draft used for deletion separate from the draft used for publishing.
+
+### Newer skill coverage
+
+Run scenarios 22-32 to exercise campaign strategy, monitoring, export, bulk operations, cloning, audiences, measurement, account administration, and change history. Scenarios 24-25, 27, and 30 mutate state and require the confirmations described in each scenario.
+
+### Draft-first regression coverage
+
+Run scenarios 33-34 to verify that implicit tracking edits use drafts and that an explicitly requested direct write handles permission denial without overstating the credentials' restrictions. Scenario 33 requires existing published ads with tracking entries; Scenario 34 may use a mocked 403 response.
+
+Run scenario 35 to verify ad product catalog validation behavior across creates, updates, and draft workflows. Run scenarios 36-42 to verify deterministic create-request idempotency keys and exclusions. Run scenario 43 with a synthetic multi-tab plan to verify source normalization, provenance, review gating, accepted incompleteness, and draft-only execution.
+
+## Validation checklist
+
+For every scenario, verify:
+
+- [ ] The natural-language prompt routes to the intended skill or workflow.
+- [ ] The request wrapper is used for Ads API calls and sends both SDK and skill tracking headers.
+- [ ] The workflow fetches the public OpenAPI document once before its first Ads API call and checks each operation's parameters and request body against it.
+- [ ] The API method, path, parameters, and request body match the scenario.
+- [ ] The agent checks `HTTP_STATUS:` before interpreting the response.
+- [ ] Dates are calculated from the execution date rather than copied from an old example.
+- [ ] Tokens, signed URLs, customer data, and CAPI identifiers are not exposed.
+- [ ] Read-only prompts do not mutate state.
+- [ ] Destructive or externally consequential actions receive explicit confirmation at the required boundary.
+- [ ] POST and PATCH requests are not automatically retried after ambiguous failures.
+- [ ] Results are summarized clearly, including partial failures in batch workflows.
+- [ ] Mutating campaign/ad set/ad workflows fetch the live ad product catalog once per workflow, block known violations, and do not add per-field success checklists or redundant confirmations.
+
+## Test fixtures
+
+Record fixture IDs outside this repository. Useful fixtures include:
+
+- one live `[Test reject]` campaign hierarchy that can be paused, cloned, and reported on
+- two unpublished draft campaigns: one to publish and one to delete
+- READY audio and image assets
+- a tiny synthetic customer-list CSV containing invented data only
+- a Pixel/CAPI/dataset topology with known diagnostics for read-only measurement tests
+- a non-owner account member whose access can be inspected; only mutate membership in a dedicated test business
+
+Token-refresh testing requires `auth_flow: "authorization_code_pkce"`, a valid refresh token, and the team-owned client ID. Set `token_expires_at` to a past timestamp. No application secret or platform credential store is involved.
+
+Initial OAuth authorization must leave token values out of captured helper
+stdout and atomically replace the active settings file with mode 0600. Codex
+hook tests must also assert the manifest uses `${PLUGIN_ROOT}` without a cwd
+fallback.
+
+Run the automated OAuth regressions with:
+
+```bash
+python3 tests/test-oauth-pkce.py
+bash tests/test-check-token.sh
+bash tests/test-pkce-runtime-guard.sh
+```

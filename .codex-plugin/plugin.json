@@ -1,0 +1,28 @@
+{
+  "name": "spotify-ads-api",
+  "version": "1.10.0",
+  "description": "Manage Spotify ad campaigns, audiences, measurement, account access, assets, and reporting with natural language and OAuth.",
+  "author": {
+    "name": "Alex Murphy"
+  },
+  "homepage": "https://github.com/spotify/ads-agentic-tools",
+  "repository": "https://github.com/spotify/ads-agentic-tools",
+  "license": "Apache-2.0",
+  "keywords": ["spotify", "ads", "api", "campaigns", "advertising", "oauth", "reporting"],
+  "skills": "./skills/",
+  "hooks": "./.codex-plugin/hooks.json",
+  "interface": {
+    "displayName": "Spotify Ads API",
+    "shortDescription": "Manage Spotify ads, audiences, and measurement",
+    "longDescription": "Plan and manage campaigns, ad sets, ads, audiences, creative assets, conversion measurement, account access, and reporting through the Spotify Ads API v3.",
+    "developerName": "Spotify",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://developer.spotify.com/documentation/ads-api",
+    "defaultPrompt": [
+      "Plan and build a Spotify campaign as a validated draft.",
+      "Upload a customer list and create a Spotify Ads audience.",
+      "Audit my Spotify Pixel, CAPI, and ad-account access."
+    ]
+  }
+}

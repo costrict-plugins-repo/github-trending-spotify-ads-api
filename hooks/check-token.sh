@@ -1,0 +1,377 @@
+#!/bin/bash
+set -uo pipefail
+
+# Spotify Ads API pre-tool hook (PreToolUse on Claude/Codex/Antigravity)
+#
+# Two jobs, both before any command that targets the Spotify Ads API:
+#   1. Auto-refresh expired OAuth tokens.
+#   2. Enforce telemetry attribution, so per-skill usage and error-rate
+#      reporting is not blind to raw curl calls made outside a skill's api()
+#      wrapper. Logic lives in lib/attribution.sh.
+#
+# Claude/Codex payload: .tool_input.command; supports command rewriting, and
+#   carries .transcript_path (nullable on Codex).
+# Antigravity payload: .toolCall.args.CommandLine; decision allow/deny only (no
+#   rewrite), so attribution there is a nudge rather than an injection.
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [ -n "${CODEX_PLUGIN_ROOT:-}" ] && [ -d "${CODEX_PLUGIN_ROOT:-}" ]; then
+  PLUGIN_ROOT="$CODEX_PLUGIN_ROOT"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  PLUGIN_ROOT="$CLAUDE_PLUGIN_ROOT"
+fi
+
+# Read all stdin (hook input JSON)
+input=$(cat)
+
+# Fast path: skip anything that cannot be a Spotify Ads API call. The literal
+# host covers most calls; $BASE_URL covers the variable form used by the assets
+# and audiences upload flows; api-request.sh covers the skills' api() wrapper,
+# whose commands name neither. Precise matching happens on the extracted command.
+case "$input" in
+  *api-partner.spotify.com*) ;;
+  *BASE_URL*) ;;
+  *api-request.sh*) ;;
+  *) exit 0 ;;
+esac
+
+# Prefer jq for JSON; fall back to grep/sed for minimal parsing
+HAS_JQ=false
+if command -v jq &>/dev/null; then
+  HAS_JQ=true
+fi
+
+json_extract_string() {
+  printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+# --- Platform detection ---
+# Codex passes no CODEX_* variable to hook processes (only CLAUDE_PLUGIN_ROOT and
+# CLAUDE_PLUGIN_DATA, so those do not identify Claude). Its PreToolUse payload has
+# a top-level turn_id, which Claude's does not, so that identifies a Codex hook.
+# Detecting it here rather than in .codex-plugin/hooks.json matters: Codex pins
+# each plugin hook command by hash and skips it once the command changes.
+# Otherwise this mirrors scripts/api-request.sh. Explicit *_PROJECT_DIR vars win
+# over the shell markers below, which a nested agent can inherit from its parent.
+# Claude Code sets CLAUDE_PROJECT_DIR only for hooks; its Bash tool shell has
+# CLAUDECODE=1 instead. Codex exports CODEX_THREAD_ID (or CODEX_SESSION_ID) to
+# every shell command and never CODEX_PROJECT_DIR, which is kept for overrides.
+# Antigravity sets no known marker, so it is the default.
+payload_has_turn_id() {
+  if [ "$HAS_JQ" = true ]; then
+    printf '%s' "$input" | jq -e 'type == "object" and has("turn_id")' >/dev/null 2>&1
+  else
+    # A "turn_id" inside a string value is escaped as \"turn_id\", so skip those.
+    printf '%s' "$input" | grep -q '[^\\]"turn_id"[[:space:]]*:'
+  fi
+}
+
+if [ -n "${CODEX_PROJECT_DIR:-}" ] || payload_has_turn_id; then
+  PLATFORM="codex"
+elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  PLATFORM="claude"
+elif [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
+  PLATFORM="codex"
+elif [ "${CLAUDECODE:-}" = "1" ]; then
+  PLATFORM="claude"
+else
+  PLATFORM="antigravity"
+fi
+
+PROJECT_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+
+find_settings_file() {
+  local order dir candidate
+
+  case "$PLATFORM" in
+    antigravity) order=".agents .claude .codex" ;;
+    claude) order=".claude .codex .agents" ;;
+    *)      order=".codex .claude .agents" ;;
+  esac
+
+  for dir in $order; do
+    candidate="$PROJECT_DIR/$dir/spotify-ads-api.local.md"
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+}
+
+# Cross-platform Python discovery: prefer python3 on Unix, py on Windows
+find_python() {
+  local cmd candidates os_type
+  os_type="$(uname -s 2>/dev/null || echo unknown)"
+  case "$os_type" in
+    MINGW*|MSYS*|CYGWIN*) candidates="py python python3" ;;
+    *)                     candidates="python3 python py" ;;
+  esac
+  for cmd in $candidates; do
+    if command -v "$cmd" &>/dev/null; then
+      printf '%s\n' "$cmd"
+      return
+    fi
+  done
+}
+
+# Extract the command from tool input (different field paths per platform)
+# Claude/Codex: .tool_input.command
+# Antigravity:  .toolCall.args.CommandLine
+if [ "$HAS_JQ" = true ]; then
+  command=$(printf '%s' "$input" | jq -r '
+    .tool_input.command //
+    .tool_input.cmd //
+    .input.command //
+    .input.cmd //
+    .toolCall.args.CommandLine //
+    .toolCall.args.command //
+    ""')
+  # Path to the session transcript, for best-effort skill inference.
+  # Claude/Codex: .transcript_path (Codex may send null). Antigravity: .transcriptPath.
+  transcript_path=$(printf '%s' "$input" | jq -r '
+    .transcript_path //
+    .transcriptPath //
+    ""')
+else
+  command=$(json_extract_string "$input" "command")
+  if [ -z "$command" ]; then
+    command=$(json_extract_string "$input" "cmd")
+  fi
+  if [ -z "$command" ]; then
+    command=$(json_extract_string "$input" "CommandLine")
+  fi
+  transcript_path=""
+fi
+
+# Does this command actually target the Spotify Ads API? The literal host is
+# unambiguous, as is delegation to the plugin's api-request.sh wrapper.
+# $BASE_URL is not, since any project may define it, so require
+# Spotify-specific corroboration before claiming the command as ours.
+is_spotify_api_call() {
+  case "$1" in
+    *api-partner.spotify.com*|*api-request.sh*) return 0 ;;
+  esac
+  case "$1" in
+    *BASE_URL*)
+      case "$1" in
+        *X-Spotify-Ads-*|*SDK_HEADER*|*SKILL_HEADER*|*ad_accounts*) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+if [[ -z "$command" ]] || ! is_spotify_api_call "$command"; then
+  exit 0
+fi
+
+# Start with the original command; will be modified as needed
+modified_command="$command"
+system_message=""
+
+# --- Locate settings file and attempt token refresh ---
+SETTINGS_FILE="$(find_settings_file || true)"
+
+if [ -n "$SETTINGS_FILE" ] && [ -f "$SETTINGS_FILE" ]; then
+  # Parse a single value from YAML frontmatter
+  get_setting() {
+    grep "^${1}:" "$SETTINGS_FILE" | head -1 | sed "s/^${1}: *//" | tr -d '"' | tr -d "'"
+  }
+
+  access_token=$(get_setting "access_token")
+  token_expires_at=$(get_setting "token_expires_at")
+  refresh_token=$(get_setting "refresh_token")
+  client_id=$(get_setting "client_id")
+  auth_flow=$(get_setting "auth_flow")
+
+  # Determine if token needs refresh
+  needs_refresh=false
+
+  if [ -z "$token_expires_at" ]; then
+    needs_refresh=true
+  else
+    expires_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$token_expires_at" +%s 2>/dev/null || \
+                    date -d "$token_expires_at" +%s 2>/dev/null || \
+                    echo "0")
+    now_epoch=$(date +%s)
+    if [ "$now_epoch" -ge "$expires_epoch" ]; then
+      needs_refresh=true
+    fi
+  fi
+
+  if [ "$auth_flow" = "authorization_code_pkce" ] && [ "$needs_refresh" = true ]; then
+    if [ -z "$refresh_token" ] || [ -z "$client_id" ]; then
+      system_message="Spotify API token is expired but PKCE refresh settings are incomplete. Run the configure skill (/spotify-ads-api:configure on Claude/Codex, /configure on Antigravity) to authorize again."
+    else
+      REFRESH_SCRIPT="${PLUGIN_ROOT}/skills/configure/scripts/refresh-token.py"
+      refresh_runner=()
+      PYTHON="$(find_python || true)"
+      if [ -n "$PYTHON" ]; then
+        refresh_runner=("$PYTHON")
+      elif command -v uv &>/dev/null; then
+        refresh_runner=(uv run)
+      else
+        system_message="Spotify API token is expired, but Python 3 or uv is required for automatic PKCE refresh. Install either runtime or run the configure skill to authorize again."
+      fi
+
+      refresh_status=0
+      refresh_detail=""
+      if [ "${#refresh_runner[@]}" -gt 0 ]; then
+        # Keep stderr separate from the token JSON on stdout, so a failure can
+        # surface the helper's diagnostic (it never prints token values).
+        refresh_err="$(mktemp "${TMPDIR:-/tmp}/spotify-ads-refresh.XXXXXX" 2>/dev/null || true)"
+        refresh_result=$(printf '%s' "$refresh_token" | "${refresh_runner[@]}" "$REFRESH_SCRIPT" \
+          --client-id "$client_id" \
+          --refresh-token-stdin 2>"${refresh_err:-/dev/null}") || refresh_status=$?
+        if [ -n "$refresh_err" ]; then
+          refresh_detail="$(tail -n 1 "$refresh_err" 2>/dev/null | cut -c1-300)"
+          rm -f "$refresh_err"
+        fi
+      fi
+
+      if [ "${#refresh_runner[@]}" -gt 0 ] && [ "$refresh_status" -eq 0 ]; then
+
+        if [ "$HAS_JQ" = true ]; then
+          new_token=$(echo "$refresh_result" | jq -r '.access_token // ""')
+          expires_in=$(echo "$refresh_result" | jq -r 'if (.expires_in | type) == "number" then .expires_in else 3600 end')
+          new_refresh=$(echo "$refresh_result" | jq -r '.refresh_token // ""')
+        else
+          new_token=$(json_extract_string "$refresh_result" "access_token")
+          expires_in=$(printf '%s' "$refresh_result" | sed -n 's/.*"expires_in"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+          expires_in=${expires_in:-3600}
+          new_refresh=$(json_extract_string "$refresh_result" "refresh_token")
+        fi
+
+        if [ -n "$new_token" ]; then
+          new_expires=$(date -u -v+"${expires_in}"S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                        date -u -d "+${expires_in} seconds" +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Replace all OAuth values in one atomic rename. If Spotify omits a
+          # rotated refresh token, retain the existing value.
+          effective_refresh="${new_refresh:-$refresh_token}"
+          tmp="${SETTINGS_FILE}.tmp.$$"
+          if (umask 077; ACCESS_TOKEN="$new_token" TOKEN_EXPIRES_AT="$new_expires" REFRESH_TOKEN="$effective_refresh" awk '
+              BEGIN {
+                access=ENVIRON["ACCESS_TOKEN"]
+                expires=ENVIRON["TOKEN_EXPIRES_AT"]
+                refresh=ENVIRON["REFRESH_TOKEN"]
+              }
+              /^access_token: / && !seen_access { print "access_token: \""access"\""; seen_access=1; next }
+              /^token_expires_at: / && !seen_expires { print "token_expires_at: \""expires"\""; seen_expires=1; next }
+              /^refresh_token: / && !seen_refresh { print "refresh_token: \""refresh"\""; seen_refresh=1; next }
+              { print }
+            ' "$SETTINGS_FILE" > "$tmp") && mv "$tmp" "$SETTINGS_FILE"; then
+            if [ -n "$access_token" ]; then
+              set -f
+              modified_command="${modified_command//"$access_token"/$new_token}"
+              set +f
+            fi
+            system_message="Spotify API token was expired and has been refreshed automatically. Re-read the access_token from the settings file before retrying."
+          else
+            rm -f "$tmp"
+            system_message="Spotify API token refreshed, but the settings file could not be updated atomically. Run the configure skill before retrying."
+          fi
+        else
+          system_message="Spotify token refresh returned no access token. Run the configure skill to authorize again."
+        fi
+      elif [ "${#refresh_runner[@]}" -gt 0 ]; then
+        if [ "$refresh_status" -eq 1 ]; then
+          system_message="Spotify OAuth refresh was rejected (invalid_grant). Run the configure skill (/spotify-ads-api:configure on Claude/Codex, /configure on Antigravity) to authorize again."
+        else
+          system_message="Failed to refresh Spotify API token${refresh_detail:+ ($refresh_detail)}. Run the configure skill (/spotify-ads-api:configure on Claude/Codex, /configure on Antigravity) to authorize again."
+        fi
+      fi
+    fi
+  elif [ "$auth_flow" = "direct_token" ] && [ "$needs_refresh" = true ]; then
+    system_message="This direct Spotify API token is expired or has no expiry metadata and cannot refresh automatically. Configure OAuth with PKCE or provide a new direct token."
+  elif [ -z "$auth_flow" ]; then
+    if [ "$needs_refresh" = true ]; then
+      system_message="This legacy Spotify OAuth configuration is expired and cannot refresh without reauthorization. Run the configure skill to migrate to PKCE."
+    else
+      system_message="Legacy Spotify OAuth configuration detected. The current token can be used until it expires; run the configure skill once to migrate to PKCE."
+    fi
+  fi
+fi
+
+# --- Skill and SDK attribution ---
+#
+# Sourced here rather than at the top so an unrelated Bash call still exits on
+# the fast path without paying for it. This file owns the single command
+# rewrite, which now carries both the refreshed token and the attribution
+# headers; see lib/attribution.sh for why attribution must not be its own hook.
+#
+# SPOTIFY_ADS_ATTRIBUTION_LIB overrides the path so a deliberately broken copy
+# can be tested without editing the installed one.
+ATTRIBUTION_LIB="${SPOTIFY_ADS_ATTRIBUTION_LIB:-$SCRIPT_DIR/lib/attribution.sh}"
+
+if [ -f "$ATTRIBUTION_LIB" ]; then
+  # shellcheck source=lib/attribution.sh
+  . "$ATTRIBUTION_LIB"
+
+  apply_attribution "$command" "$modified_command" "$PLATFORM" "$transcript_path"
+  modified_command="$ATTRIBUTION_COMMAND"
+
+  if [ -n "$ATTRIBUTION_NOTE" ]; then
+    system_message="${system_message:+$system_message }$ATTRIBUTION_NOTE"
+  fi
+fi
+
+# --- Emit output ---
+# Claude/Codex: permissionDecision + updatedInput to rewrite the command.
+# Antigravity: decision + reason (no command rewriting support).
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\n'
+}
+
+if [ "$PLATFORM" = "antigravity" ]; then
+  if [ -n "$system_message" ]; then
+    if [ "$HAS_JQ" = true ]; then
+      jq -n --arg msg "$system_message" '{
+        "decision": "allow",
+        "reason": $msg
+      }' 2>/dev/null
+    else
+      printf '{"decision":"allow","reason":"%s"}\n' "$(json_escape "$system_message")"
+    fi
+  fi
+else
+  if [[ "$modified_command" != "$command" ]]; then
+    if [ -n "$system_message" ]; then
+      if [ "$HAS_JQ" = true ]; then
+        jq -n --arg cmd "$modified_command" --arg msg "$system_message" '{
+          "hookSpecificOutput": {
+            "permissionDecision": "allow",
+            "updatedInput": {"command": $cmd}
+          },
+          "systemMessage": $msg
+        }' 2>/dev/null
+      else
+        printf '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"%s"}},"systemMessage":"%s"}\n' \
+          "$(json_escape "$modified_command")" "$(json_escape "$system_message")"
+      fi
+    else
+      if [ "$HAS_JQ" = true ]; then
+        jq -n --arg cmd "$modified_command" '{
+          "hookSpecificOutput": {
+            "permissionDecision": "allow",
+            "updatedInput": {"command": $cmd}
+          }
+        }' 2>/dev/null
+      else
+        printf '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"%s"}}}\n' \
+          "$(json_escape "$modified_command")"
+      fi
+    fi
+  elif [ -n "$system_message" ]; then
+    if [ "$HAS_JQ" = true ]; then
+      jq -n --arg msg "$system_message" '{"systemMessage": $msg}' 2>/dev/null
+    else
+      printf '{"systemMessage":"%s"}\n' "$(json_escape "$system_message")"
+    fi
+  fi
+fi
+
+exit 0

@@ -1,0 +1,347 @@
+#!/bin/bash
+set -uo pipefail
+
+# Spotify Ads API request wrapper
+#
+# Usage:
+#   api-request.sh <skill> <METHOD> <path> [json_body]
+#   api-request.sh --env
+#
+# Examples:
+#   api-request.sh campaigns GET "ad_accounts/{ad_account_id}/campaigns?limit=50"
+#   api-request.sh drafts POST "ad_accounts/{ad_account_id}/drafts/campaigns" '{"name":"My Campaign"}'
+#   api-request.sh --env   # prints TOKEN, AD_ACCOUNT_ID, AUTO_EXECUTE, BASE_URL,
+#                          # SDK_HEADER, PLUGIN_VERSION (and SKILL_HEADER when a
+#                          # skill name is given). Output is eval-safe:
+#                          # eval $(api-request.sh assets --env)
+
+BASE_URL="https://api-partner.spotify.com/ads/v3"
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [ -n "${CODEX_PLUGIN_ROOT:-}" ] && [ -d "${CODEX_PLUGIN_ROOT:-}" ]; then
+  PLUGIN_ROOT="$CODEX_PLUGIN_ROOT"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  PLUGIN_ROOT="$CLAUDE_PLUGIN_ROOT"
+fi
+
+# --- Platform detection (mirrors check-token.sh) ---
+# Explicit *_PROJECT_DIR vars win over the shell markers below, which a nested
+# agent can inherit from its parent (e.g. Claude Code started from a Codex shell).
+# Claude Code sets CLAUDE_PROJECT_DIR only for hooks; its Bash tool shell has
+# CLAUDECODE=1 instead. Codex exports CODEX_THREAD_ID (or CODEX_SESSION_ID) to
+# every shell command and never CODEX_PROJECT_DIR, which is kept for overrides.
+# Antigravity sets no known marker, so it is the default.
+if [ -n "${CODEX_PROJECT_DIR:-}" ]; then
+  PLATFORM="codex"
+elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  PLATFORM="claude"
+elif [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
+  PLATFORM="codex"
+elif [ "${CLAUDECODE:-}" = "1" ]; then
+  PLATFORM="claude"
+else
+  PLATFORM="antigravity"
+fi
+
+PROJECT_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+
+# Eval replay only: settings must come from the eval workspace. Agents sometimes cd
+# into the plugin before calling this script, and a plugin checkout can hold a real
+# settings file. The workspace is the folder holding the (relative) fixtures dir:
+# the project dir, else $HOME/cwd, where plugin eval puts it. With neither, stop
+# instead of reading whatever settings file is nearby.
+if [ -n "${EVAL_ADS_API_FIXTURES:-}" ] && [ "${EVAL_ADS_API_FIXTURES#/}" = "$EVAL_ADS_API_FIXTURES" ] \
+  && [ ! -d "$PROJECT_DIR/$EVAL_ADS_API_FIXTURES" ]; then
+  if [ -d "${HOME:-}/cwd/$EVAL_ADS_API_FIXTURES" ]; then
+    PROJECT_DIR="$HOME/cwd"
+  else
+    echo "ERROR: No settings file found. Run the configure skill first." >&2
+    exit 1
+  fi
+fi
+
+# --- Settings file discovery ---
+find_settings_file() {
+  local order dir candidate
+
+  case "$PLATFORM" in
+    antigravity) order=".agents .claude .codex" ;;
+    claude) order=".claude .codex .agents" ;;
+    *)      order=".codex .claude .agents" ;;
+  esac
+
+  for dir in $order; do
+    candidate="$PROJECT_DIR/$dir/spotify-ads-api.local.md"
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+}
+
+SETTINGS_FILE="$(find_settings_file || true)"
+
+if [ -z "$SETTINGS_FILE" ] || [ ! -f "$SETTINGS_FILE" ]; then
+  echo "ERROR: No settings file found. Run the configure skill first." >&2
+  exit 1
+fi
+
+get_setting() {
+  grep "^${1}:" "$SETTINGS_FILE" | head -1 | sed "s/^${1}: *//" | tr -d '"' | tr -d "'"
+}
+
+TOKEN=$(get_setting "access_token")
+AD_ACCOUNT_ID=$(get_setting "ad_account_id")
+AUTO_EXECUTE=$(get_setting "auto_execute")
+CLIENT_ID=$(get_setting "client_id")
+
+if [ -z "$TOKEN" ]; then
+  echo "ERROR: No access_token in settings file. Run the configure skill first." >&2
+  exit 1
+fi
+
+# --- Plugin version from platform manifest ---
+PLUGIN_VERSION=""
+for manifest in "$PLUGIN_ROOT/.codex-plugin/plugin.json" \
+                "$PLUGIN_ROOT/.claude-plugin/plugin.json" \
+                "$PLUGIN_ROOT/plugin.json"; do
+  if [ -f "$manifest" ]; then
+    PLUGIN_VERSION=$(grep '"version"' "$manifest" | head -1 | sed 's/.*"version" *: *"\([^"]*\)".*/\1/')
+    break
+  fi
+done
+
+# --- SDK product name ---
+case "$PLATFORM" in
+  codex)  SDK_PRODUCT="codex-plugin" ;;
+  claude) SDK_PRODUCT="claude-code-plugin" ;;
+  *)      SDK_PRODUCT="antigravity-cli-plugin" ;;
+esac
+
+SDK_HEADER="X-Spotify-Ads-Sdk: ${SDK_PRODUCT}/${PLUGIN_VERSION}"
+
+# --- --env mode: print settings and exit ---
+#
+# Values are single-quoted so `eval $(api --env)` assigns them intact. Unquoted,
+# the space inside SDK_HEADER splits the assignment and eval treats every line
+# as a prefix assignment to a bogus command, silently setting nothing at all.
+if [ "${1:-}" = "--env" ] || [ "${2:-}" = "--env" ]; then
+  ENV_SKILL="${1:-}"
+  [ "$ENV_SKILL" = "--env" ] && ENV_SKILL=""
+
+  print_env() {
+    # Escape any embedded single quote so the value survives eval intact.
+    printf "%s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"
+  }
+
+  print_env TOKEN "$TOKEN"
+  print_env AD_ACCOUNT_ID "$AD_ACCOUNT_ID"
+  print_env AUTO_EXECUTE "${AUTO_EXECUTE:-false}"
+  print_env BASE_URL "$BASE_URL"
+  print_env SDK_HEADER "$SDK_HEADER"
+  print_env PLUGIN_VERSION "$PLUGIN_VERSION"
+  if [ -n "$ENV_SKILL" ]; then
+    print_env SKILL_HEADER "X-Spotify-Ads-Skill: $ENV_SKILL"
+  fi
+  exit 0
+fi
+
+# --- Parse arguments ---
+NO_DEDUP_KEY=false
+SKILL="$1"
+shift
+
+if [ "${1:-}" = "--no-dedup-key" ]; then
+  NO_DEDUP_KEY=true
+  shift
+fi
+
+if [ $# -lt 2 ]; then
+  echo "Usage: api-request.sh <skill> [--no-dedup-key] <METHOD> <path> [json_body]" >&2
+  echo "       api-request.sh --env" >&2
+  exit 1
+fi
+
+METHOD="$1"
+PATH_ARG="$2"
+BODY="${3:-}"
+
+SKILL_HEADER="X-Spotify-Ads-Skill: ${SKILL}"
+
+# --- Substitute {ad_account_id} in path and body ---
+PATH_ARG="${PATH_ARG//\{ad_account_id\}/$AD_ACCOUNT_ID}"
+BODY="${BODY//\{ad_account_id\}/$AD_ACCOUNT_ID}"
+
+URL="${BASE_URL}/${PATH_ARG}"
+
+# --- Pre-send validation against the workflow's OpenAPI document ---
+#
+# Blocks what is never valid: missing or null required fields (at any depth),
+# missing required query parameters and bodies, wrong types, bounds, read-only
+# fields, and invalid JSON. Those are reported on stderr and the
+# request is NOT sent (exit 3), so it never reaches the API, consumes no retry,
+# and cannot be half-applied.
+#
+# Names and values the spec does not define are a WARNING and the request is
+# still sent (exit 5 from the validator): undefined fields and query parameters,
+# and enum or discriminator values outside the spec's lists. A local block could
+# reject a request the user explicitly asked for; the warning names each item
+# and suggests the closest defined name.
+#
+# There is no opt-out: what still blocks is never valid, and the spec is fetched
+# fresh for each workflow. A wrong rule in the spec is fixed upstream.
+#
+# The document is the one the live OpenAPI preflight already downloaded for this
+# workflow; nothing is downloaded here. Fails open by design when it cannot
+# judge: no document fetched yet, python missing, or an operation the spec
+# does not list (sent with a warning).
+validate_against_spec() {
+  local py out rc
+  for py in python3 python py; do
+    command -v "$py" >/dev/null 2>&1 && break
+    py=""
+  done
+  [ -n "$py" ] || return 0
+  [ -n "$("$py" "$SCRIPT_DIR/openapi_tool.py" locate 2>/dev/null)" ] || return 0
+  out=$(printf '%s' "$BODY" | "$py" "$SCRIPT_DIR/openapi_tool.py" validate "$METHOD" "$PATH_ARG" 2>&1)
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    3)
+      {
+        echo "ERROR: Request not sent. $METHOD ${PATH_ARG%%\?*} does not match the Spotify Ads API OpenAPI spec:"
+        printf '%s\n' "$out" | sed -n 's/^error: /  - /p'
+        if printf '%s\n' "$out" | grep -q '^warning: '; then
+          echo "Also not defined in the spec (not blocking):"
+          printf '%s\n' "$out" | sed -n 's/^warning: /  - /p'
+        fi
+        echo "Fix the request and send it again. See: scripts/openapi-op.sh describe $METHOD \"${PATH_ARG%%\?*}\""
+      } >&2
+      return 3
+      ;;
+    5)
+      {
+        echo "WARNING: Sent anyway. These fields or values aren't defined in the Spotify Ads API OpenAPI spec:"
+        printf '%s\n' "$out" | sed -n 's/^warning: /  - /p'
+        echo "If the user didn't ask for this field or value, it's likely a mistake; fix it before the next request. If they did, keep it."
+      } >&2
+      return 0
+      ;;
+    4) echo "WARNING: $out The request was sent without spec validation." >&2 ;;
+    *) echo "WARNING: Spec validation was skipped: $out" >&2 ;;
+  esac
+  return 0
+}
+
+validate_against_spec || exit $?
+
+# --- Build and execute curl ---
+CURL_ARGS=(-s -w "\nHTTP_STATUS:%{http_code}")
+CURL_ARGS+=(-X "$METHOD")
+CURL_ARGS+=(-H "Authorization: Bearer ${TOKEN}")
+CURL_ARGS+=(-H "$SDK_HEADER")
+CURL_ARGS+=(-H "$SKILL_HEADER")
+
+# --- Auto-inject dedup key for supported create endpoints ---
+if [ "$METHOD" = "POST" ] && [ "$NO_DEDUP_KEY" = "false" ]; then
+  RESOLVED_PATH="${PATH_ARG%%\?*}"
+  if printf '%s' "$RESOLVED_PATH" | grep -qE "^ad_accounts/[^/]+/(drafts/)?(campaigns|ad_sets|ads)$"; then
+    DEDUP_KEY=$(python3 "$SCRIPT_DIR/canonical-hash.py" "$BODY" "$BASE_URL" "$RESOLVED_PATH" "$METHOD" "$CLIENT_ID" 2>/dev/null \
+      || uv run "$SCRIPT_DIR/canonical-hash.py" "$BODY" "$BASE_URL" "$RESOLVED_PATH" "$METHOD" "$CLIENT_ID" 2>/dev/null \
+      || printf '%s' "${BASE_URL}|${METHOD}|${RESOLVED_PATH}|${CLIENT_ID}|${BODY}" | shasum -a 256 | cut -d' ' -f1)
+    CURL_ARGS+=(-H "Idempotency-Key: ${DEDUP_KEY}")
+  fi
+fi
+
+if [ -n "$BODY" ]; then
+  CURL_ARGS+=(-H "Content-Type: application/json")
+  CURL_ARGS+=(-d "$BODY")
+fi
+
+# --- Eval replay and record modes ---
+#
+# For offline evals only (evals/README.md). A fixture is <key>.http: first line
+# the HTTP status, the rest the response body. The key is METHOD__path with the
+# query dropped, the ad account ID put back as {ad_account_id}, other UUIDs as
+# {id}, and "/" as "__".
+#
+# Replay (EVAL_ADS_API_FIXTURES=<dir>): answer from fixtures instead of calling
+# the API, and append each request to $EVAL_ADS_API_LOG so graders can check
+# what was sent. <key>.<n>.http answers the nth call to a key, then
+# <key>.match-<WORD>.http answers when the request path (with its query) or
+# body contains WORD, for requests that share a key such as draft VALIDATE and
+# PUBLISH or a list filtered by query; then <key>.http.
+# A request with no fixture gets a plain 404.
+#
+# Record (EVAL_ADS_API_RECORD=<dir>): make the real request and save the
+# response as <key>.http. Only GET is allowed unless
+# EVAL_ADS_API_RECORD_ALLOW_WRITES=1, so recording can't change an account.
+fixture_key() {
+  local key_path="${PATH_ARG%%\?*}" placeholder='{ad_account_id}'
+  [ -n "$AD_ACCOUNT_ID" ] && key_path="${key_path//"$AD_ACCOUNT_ID"/$placeholder}"
+  key_path=$(printf '%s' "$key_path" \
+    | sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/{id}/g; s#/#__#g')
+  printf '%s__%s' "$METHOD" "$key_path"
+}
+
+resolve_dir() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s/%s' "$PROJECT_DIR" "$1" ;;
+  esac
+}
+
+if [ -n "${EVAL_ADS_API_FIXTURES:-}" ]; then
+  FIXTURE_DIR=$(resolve_dir "$EVAL_ADS_API_FIXTURES")
+  LOG_FILE="${EVAL_ADS_API_LOG:-$PROJECT_DIR/.claude/.api-requests.log}"
+  KEY=$(fixture_key)
+
+  CALL_N=1
+  if [ -f "$LOG_FILE" ]; then
+    CALL_N=$(( $(awk -v k="$KEY " 'index($0, k) == 1' "$LOG_FILE" | wc -l) + 1 ))
+  fi
+  printf '%s %s %s\n' "$KEY" "$PATH_ARG" "$(printf '%s' "$BODY" | tr '\n' ' ')" >> "$LOG_FILE"
+
+  FIXTURE="$FIXTURE_DIR/${KEY}.${CALL_N}.http"
+  if [ ! -f "$FIXTURE" ]; then
+    FIXTURE=""
+    for candidate in "$FIXTURE_DIR/${KEY}".match-*.http; do
+      [ -f "$candidate" ] || continue
+      word="${candidate##*.match-}"
+      word="${word%.http}"
+      case "$PATH_ARG $BODY" in
+        *"$word"*) FIXTURE="$candidate"; break ;;
+      esac
+    done
+    [ -n "$FIXTURE" ] || FIXTURE="$FIXTURE_DIR/${KEY}.http"
+  fi
+  if [ ! -f "$FIXTURE" ]; then
+    # Look like a real API 404 so the agent under test can't tell it's in an eval.
+    # The request log above already records the key that had no fixture.
+    # Same shape as the real API's 404 body (recorded), including its camelCase key.
+    printf '{"errorCodes":[],"messages":["Resource not found"]}\nHTTP_STATUS:404\n'
+    exit 0
+  fi
+  tail -n +2 "$FIXTURE"
+  printf '\nHTTP_STATUS:%s\n' "$(head -1 "$FIXTURE" | tr -d '[:space:]')"
+  exit 0
+fi
+
+if [ -n "${EVAL_ADS_API_RECORD:-}" ]; then
+  if [ "$METHOD" != "GET" ] && [ "${EVAL_ADS_API_RECORD_ALLOW_WRITES:-}" != "1" ]; then
+    echo "ERROR: Recording mode only sends GET requests. Refusing $METHOD $PATH_ARG." >&2
+    exit 1
+  fi
+  RECORD_DIR=$(resolve_dir "$EVAL_ADS_API_RECORD")
+  mkdir -p "$RECORD_DIR"
+  RESPONSE=$(curl "${CURL_ARGS[@]}" "$URL")
+  STATUS="${RESPONSE##*HTTP_STATUS:}"
+  RESPONSE_BODY="${RESPONSE%$'\n'HTTP_STATUS:*}"
+  printf '%s\n%s\n' "$STATUS" "$RESPONSE_BODY" > "$RECORD_DIR/$(fixture_key).http"
+  printf '%s\n' "$RESPONSE"
+  exit 0
+fi
+
+exec curl "${CURL_ARGS[@]}" "$URL"
